@@ -1,18 +1,17 @@
--- Drop the view if it already exists to ensure a fresh start
-DROP VIEW IF EXISTS adhoc.nexus_mart_view_s;
+DROP VIEW IF EXISTS adhoc.nexus_stage_view_s;
 
--- Create or replace the view with the new definition
-CREATE OR REPLACE VIEW adhoc.nexus_mart_view_s AS
--- Step 1: Calculate live members with member_name
-WITH live_members AS (
+CREATE OR REPLACE VIEW adhoc.nexus_stage_view_s AS
+-- Step 1: Calculate live creators
+WITH live_creators AS (
     SELECT
         mn.member_id,
         mn.program_id,
         mn.post_id,
-        mn.client_id,
-        mn.id,
+        mn.client_id::text,
+        mn.id AS mention_id,
         mn.community_id,
         mn.cost,
+        mn.project_id,
         'LIVE' AS creator_status,
         m.name AS member_name
     FROM bi.mention mn
@@ -20,14 +19,187 @@ WITH live_members AS (
     WHERE mn.client_id = 'wpNVzQZ7FoyqUaqb75WP1XBgUTEyLzvZ'
 ),
 
--- Step 2: Calculate live post performance with member_name
-daily_aggregates AS (
+-- Step 2: Get all approved members and join with content review to create different statuses
+approved_members AS (
     SELECT
-        lm.member_id,
-        lm.program_id,
-        lm.post_id,
-        lm.creator_status,
-        lm.member_name,
+        m.id AS member_id,
+        m.name AS member_name
+    FROM bi.member m
+    JOIN bi.program_membership pm ON m.id = pm."memberId"
+    WHERE m."clientId" = 'wpNVzQZ7FoyqUaqb75WP1XBgUTEyLzvZ'
+    AND pm.status = 'approved'
+),
+
+content_status AS (
+    SELECT
+        cr.member_id,
+        cr.post_id,
+        cr.id AS content_review_id,
+        cr.campaign_id,
+        cr.state AS content_review_state,
+        cr.project_id,
+        cr.datetime_created,
+        cr.datetime_modified,
+        cr.date_last_reject,
+        cr.time_to_mark_complete,
+        am.member_name,
+        NULL::text AS client_id,
+        NULL::bigint AS mention_id,
+        NULL::bigint AS community_id,
+        NULL::bigint AS cost,
+        NULL::bigint AS program_id,
+        CASE
+            WHEN cr.state = 'PLACEHOLDER' THEN 'LOCKED'
+            WHEN cr.state = 'ACCEPTED' THEN 'APPROVED'
+            WHEN cr.state IN ('REJECTED', 'AMENDED') THEN 'CONTENT REVIEW'
+            WHEN cr.state = 'MARKED_COMPLETE' THEN 'UGC COMPLETE'
+            WHEN cr.state = 'COMPLETED' THEN 'DROP AND PAY'
+            WHEN cr.post_id IS NOT NULL THEN 'NOT RECOGNIZED'
+            ELSE 'NOT RECOGNIZED'
+        END AS creator_status
+    FROM bi.content_review cr
+    JOIN approved_members am ON cr.member_id = am.member_id
+    WHERE cr.member_id NOT IN (SELECT member_id FROM live_creators)
+),
+
+-- Step 3: Combine live creators with the rest of the content status
+all_creators AS (
+    SELECT 
+        lc.member_id,
+        lc.program_id,
+        lc.post_id,
+        lc.client_id,
+        lc.mention_id,
+        lc.community_id,
+        lc.cost,
+        lc.project_id,
+        lc.creator_status,
+        lc.member_name
+    FROM live_creators lc
+    UNION ALL
+    SELECT 
+        cs.member_id,
+        cs.program_id::bigint,
+        cs.post_id,
+        cs.client_id::text,
+        cs.mention_id::bigint,
+        cs.community_id::bigint,
+        cs.cost::bigint,
+        cs.project_id::bigint,
+        cs.creator_status,
+        cs.member_name
+    FROM content_status cs
+),
+
+-- Step 4: Join with campaign data to get campaign name
+campaign_data AS (
+    SELECT
+        ac.*,
+        p.title AS campaign_name
+    FROM all_creators ac
+    LEFT JOIN bi.program p ON ac.program_id = p.id
+),
+
+-- Step 5: Join with agreement data to get agreement ID and date agreement agreed upon
+agreement_data AS (
+    SELECT
+        cd.member_id,
+        cd.program_id,
+        cd.project_id,
+        cd.post_id,
+        cd.client_id,
+        cd.mention_id,
+        cd.community_id,
+        cd.cost,
+        cd.creator_status,
+        cd.member_name,
+        cd.campaign_name,
+        a.id AS agreement_id,
+        a.date_agreement_agreed_upon
+    FROM campaign_data cd
+    LEFT JOIN bi.agreement a ON cd.member_id = a.member_id AND cd.project_id = a.project_id
+),
+
+-- Step 6: Join with agreement_iteration data to get id and price
+agreement_iteration_data AS (
+    SELECT
+        ad.member_id,
+        ad.program_id,
+        ad.project_id,
+        ad.post_id,
+        ad.client_id,
+        ad.mention_id,
+        ad.community_id,
+        ad.cost,
+        ad.creator_status,
+        ad.member_name,
+        ad.campaign_name,
+        ad.agreement_id,
+        ad.date_agreement_agreed_upon,
+        ai.id AS agreement_iteration_id,
+        ai.price
+    FROM agreement_data ad
+    LEFT JOIN bi.agreement_iteration ai ON ad.agreement_id = ai.agreement_id
+),
+
+-- Step 7: Join with deliverable data to get number of deliverables per agreement_iteration_id
+deliverable_data AS (
+    SELECT
+        ai.agreement_id,
+        COUNT(DISTINCT d.id) AS number_of_deliverables
+    FROM agreement_iteration_data ai
+    LEFT JOIN bi.deliverable d ON ai.agreement_iteration_id = d.agreement_iteration_id
+    GROUP BY ai.agreement_id
+),
+
+-- Step 8: Combine agreement, agreement_iteration, and deliverable data
+combined_agreement_data AS (
+    SELECT
+        ai.member_id,
+        ai.program_id,
+        ai.project_id,
+        ai.post_id,
+        ai.client_id,
+        ai.mention_id,
+        ai.community_id,
+        ai.cost,
+        ai.creator_status,
+        ai.member_name,
+        ai.campaign_name,
+        ai.agreement_id,
+        ai.date_agreement_agreed_upon,
+        ai.price,
+        dd.number_of_deliverables,
+        CASE
+            WHEN dd.number_of_deliverables = 0 THEN ai.price
+            ELSE ai.price / dd.number_of_deliverables
+        END AS avg_price_per_deliverable,
+        CASE
+            WHEN dd.number_of_deliverables = 0 THEN ai.price
+            ELSE ai.price * dd.number_of_deliverables
+        END AS budget_allocated,
+        CASE 
+            WHEN ai.agreement_id IS NOT NULL THEN
+                CASE
+                    WHEN dd.number_of_deliverables = 0 THEN ai.price
+                    ELSE ai.price * dd.number_of_deliverables
+                END
+            ELSE 0
+        END AS budget_utilized,
+        CASE 
+            WHEN ai.agreement_id IS NOT NULL THEN 'contract' 
+            ELSE 'negotiating' 
+        END AS contract_status
+    FROM agreement_iteration_data ai
+    LEFT JOIN deliverable_data dd ON ai.agreement_id = dd.agreement_id
+),
+
+-- Step 9: Join with performance data and social account data
+performance_data AS (
+    SELECT
+        cad.member_id,
+        cad.program_id,
+        cad.post_id,
         p.link AS post_link,
         p.text AS caption,
         DATE(p.datetime_posted) AS date_posted,
@@ -45,20 +217,19 @@ daily_aggregates AS (
         SUM(p.closeups) AS closeups,
         SUM(p.estimated_impressions) AS estimated_impressions,
         SUM(p.exits) AS exits,
-        lm.community_id AS community_id,
-        lm.cost AS cost,
-        lm.id AS mention_id,
         p.image AS post_image,
         SUM(p.taps) AS taps,
         SUM(p.unique_impressions) AS unique_impressions,
         SUM(p.views) AS views,
         p.social_account_id AS social_account_id,
+        sa.country_code,
+        sa.profile_image_url,
         p.datetime_created,
-        MIN(DATE(p.datetime_posted)) OVER (PARTITION BY lm.member_id) AS first_activity_date,
+        MIN(DATE(p.datetime_posted)) OVER (PARTITION BY cad.member_id) AS first_activity_date,
         -- Calculate Activation Type
         CASE
-            WHEN DATE(p.datetime_posted) = MIN(DATE(p.datetime_posted)) OVER (PARTITION BY lm.member_id) THEN 'New'
-            WHEN DATE(p.datetime_posted) > MIN(DATE(p.datetime_posted)) OVER (PARTITION BY lm.member_id) THEN 'Reactivated'
+            WHEN DATE(p.datetime_posted) = MIN(DATE(p.datetime_posted)) OVER (PARTITION BY cad.member_id) THEN 'New'
+            WHEN DATE(p.datetime_posted) > MIN(DATE(p.datetime_posted)) OVER (PARTITION BY cad.member_id) THEN 'Reactivated'
             ELSE NULL
         END AS activation_type,
         -- Calculate Creator Tier
@@ -70,422 +241,50 @@ daily_aggregates AS (
             ELSE 'Not categorized'
         END AS creator_tier,
         -- Calculate Action Date
-        CASE
-            WHEN lm.creator_status = 'LIVE' AND p.datetime_posted IS NULL THEN COALESCE(MIN(DATE(p.datetime_posted)) OVER (PARTITION BY lm.member_id), p.datetime_created, NOW())
-            WHEN lm.creator_status = 'LIVE' THEN p.datetime_posted
-            ELSE COALESCE(p.datetime_created, NOW())
-        END AS action_date,
-        -- TMV Calculation
-        CASE 
-            WHEN p.network = 'instagram' THEN 
-                COALESCE(SUM(p.likes) * 0.15, 0) +
-                COALESCE(SUM(p.comments) * 1, 0) +
-                COALESCE(SUM(p.views) * 0.05, 0) +
-                COALESCE(SUM(p.shares) * 0, 0) +
-                COALESCE(SUM(p.taps) * 3, 0) +
-                CASE WHEN DATE(p.datetime_posted) = DATE(p.datetime_posted) THEN p.current_followers * 0.003 ELSE 0 END
-            WHEN p.network = 'tiktok' THEN 
-                COALESCE(SUM(p.likes) * 0.05, 0) +
-                COALESCE(SUM(p.comments) * 0.05, 0) +
-                COALESCE(SUM(p.views) * 0.03, 0) +
-                COALESCE(SUM(p.shares) * 0.05, 0)
-            WHEN p.network = 'youtube' THEN 
-                COALESCE(SUM(p.views) * 0.15, 0) +
-                COALESCE(SUM(p.likes) * 0.15, 0) +
-                COALESCE(SUM(p.comments) * 1, 0) +
-                COALESCE(SUM(p.taps) * 3, 0)
-            WHEN p.network = 'facebook' THEN 
-                CASE WHEN DATE(p.datetime_posted) = DATE(p.datetime_posted) THEN p.current_followers * 0.007 ELSE 0 END +
-                COALESCE(SUM(p.likes) * 0.15, 0) +
-                COALESCE(SUM(p.comments) * 1, 0) +
-                COALESCE(SUM(p.shares) * 1, 0) +
-                COALESCE(SUM(p.taps) * 3, 0)
-            WHEN p.network = 'twitter' THEN 
-                CASE WHEN DATE(p.datetime_posted) = DATE(p.datetime_posted) THEN p.current_followers * 0.007 ELSE 0 END +
-                COALESCE(SUM(p.likes) * 0.15, 0) +
-                COALESCE(SUM(p.comments) * 1, 0) +
-                COALESCE(SUM(p.shares) * 1, 0) +
-                COALESCE(SUM(p.taps) * 3, 0)
-            WHEN p.network = 'pinterest' THEN 
-                COALESCE(SUM(p.taps) * 3, 0) +
-                COALESCE(SUM(p.favorites) * 3, 0) +
-                COALESCE(SUM(p.closeups) * 1.05, 0) +
-                COALESCE(SUM(p.impressions) * 0.007, 0)
-            ELSE 0
-        END AS tmv  -- TMV Calculation added
-    FROM live_members lm
-    LEFT JOIN bi.post p ON lm.post_id = p.id
+        COALESCE(p.datetime_posted, MIN(DATE(p.datetime_posted)) OVER (PARTITION BY cad.member_id), p.datetime_created, NOW()) AS action_date,
+        cad.member_name,
+        cad.creator_status,
+        cad.agreement_id,
+        cad.date_agreement_agreed_upon,
+        cad.price,
+        cad.number_of_deliverables,
+        cad.avg_price_per_deliverable,
+        cad.budget_allocated,
+        cad.budget_utilized,
+        cad.contract_status,
+        cad.campaign_name
+    FROM combined_agreement_data cad
+    LEFT JOIN bi.post p ON cad.post_id = p.id
+    LEFT JOIN bi.social_account sa ON p.social_account_id = sa.id
     GROUP BY 
-        lm.member_id, 
-        lm.program_id, 
-        lm.post_id, 
-        lm.creator_status, 
-        lm.member_name,
-        p.link, 
-        p.text, 
-        DATE(p.datetime_posted), 
-        p.network, 
+        cad.member_id,
+        cad.program_id,
+        cad.post_id,
+        p.link,
+        p.text,
+        p.datetime_posted,
+        p.network,
         p.post_type,
         p.current_followers,
-        lm.community_id,
-        lm.cost,
-        lm.id,
         p.image,
         p.social_account_id,
         p.datetime_created,
-        p.datetime_posted
-),
-
--- Step 3.1: Get all approved members with member_name
-approved_members AS (
-    SELECT DISTINCT
-        m.id AS member_id,
-        m.name AS member_name,
-        pm."programId" AS program_id
-    FROM bi.member m
-    INNER JOIN bi.program_membership pm ON m.id = pm."memberId" AND pm.status = 'approved'
-    WHERE m."clientId" = 'wpNVzQZ7FoyqUaqb75WP1XBgUTEyLzvZ'
-),
-
--- Step 3.2: Exclude 'LIVE' members from approved members
-non_live_approved_members AS (
-    SELECT
-        am.member_id,
-        am.member_name,
-        am.program_id
-    FROM approved_members am
-    WHERE am.member_id NOT IN (SELECT member_id FROM live_members)
-),
-
--- Step 4.1: Filter content reviews for non-live members
-filtered_content_reviews AS (
-    SELECT
-        cr.member_id,
-        cr.post_id,
-        cr.id AS content_review_id,
-        cr.campaign_id,
-        cr.state AS content_review_state,
-        cr.project_id,
-        cr.datetime_created,  
-        cr.datetime_modified,
-        cr.date_last_reject,
-        cr.time_to_mark_complete,
-        nlam.member_name,
-        nlam.program_id
-    FROM bi.content_review cr
-    INNER JOIN non_live_approved_members nlam ON cr.member_id = nlam.member_id
-),
-
--- Step 4.2: Calculate other creator statuses and get Program ID
-other_creator_status_data AS (
-    SELECT
-        fcr.member_id,
-        fcr.program_id,
-        fcr.post_id,
-        fcr.member_name,
-        CASE
-            WHEN fcr.content_review_state = 'PLACEHOLDER' THEN 'LOCKED'
-            WHEN fcr.content_review_state = 'ACCEPTED' THEN 'APPROVED'
-            WHEN fcr.content_review_state IN ('REJECTED', 'AMENDED') THEN 'CONTENT REVIEW'
-            WHEN fcr.content_review_state = 'MARKED_COMPLETE' THEN 'UGC COMPLETE'
-            WHEN fcr.content_review_state = 'COMPLETED' THEN 'DROP AND PAY'
-            WHEN fcr.post_id IS NOT NULL THEN 'L'
-            ELSE 'NOT RECOGNIZED'
-        END AS creator_status,
-        fcr.content_review_id,
-        fcr.campaign_id,
-        fcr.content_review_state,
-        fcr.project_id,
-        fcr.datetime_created,
-        fcr.datetime_modified,
-        fcr.date_last_reject,
-        fcr.time_to_mark_complete,
-        NULL AS post_link,
-        NULL AS caption,
-        NULL AS date_posted,
-        NULL AS insight_date,
-        NULL AS network,
-        NULL AS post_type,
-        0 AS impressions,
-        0 AS likes,
-        0 AS comments,
-        0 AS shares,
-        0 AS favorites,
-        0 AS plays,
-        0 AS dislikes,
-        0 AS current_followers,
-        0 AS closeups,
-        0 AS estimated_impressions,
-        0 AS exits,
-        NULL AS post_image,
-        0 AS taps,
-        0 AS unique_impressions,
-        0 AS views,
-        NULL AS first_activity_date,
-        NULL AS activation_type,
-        NULL AS creator_tier,
-        fcr.datetime_created AS action_date
-    FROM filtered_content_reviews fcr
-    LEFT JOIN bi.mention mn ON fcr.post_id = mn.post_id
-    LEFT JOIN bi.campaign c ON fcr.campaign_id::TEXT = c."campaignId"
-),
-
--- Step 5: Combine live and other statuses
-combined_data AS (
-    SELECT 
-        da.member_id,
-        da.program_id,
-        da.post_id,
-        da.creator_status,
-        da.community_id,
-        da.cost,
-        NULL AS content_review_id,
-        NULL AS campaign_id,
-        NULL AS content_review_state,
-        NULL AS project_id,
-        da.mention_id,
-        da.datetime_created,
-        NULL AS datetime_modified,
-        NULL AS date_last_reject,
-        NULL AS time_to_mark_complete,
-        da.creator_tier,
-        NULL AS country_code,
-        NULL AS profile_image_url,
-        da.social_account_id,
-        da.post_link,
-        da.caption,
-        da.date_posted,
-        da.network,
-        da.post_type,
-        da.insight_date,
-        da.impressions,
-        da.likes,
-        da.comments,
-        da.shares,
-        da.favorites,
-        da.plays,
-        da.dislikes,
-        da.current_followers,
-        da.closeups,
-        da.estimated_impressions,
-        da.exits,
-        da.post_image,
-        da.taps,
-        da.unique_impressions,
-        da.views,
-        da.first_activity_date,
-        da.activation_type,
-        da.action_date,
-        da.member_name,
-        da.tmv  -- Added tmv
-    FROM daily_aggregates da
-    UNION ALL
-    SELECT 
-        osd.member_id,
-        osd.program_id,
-        osd.post_id,
-        osd.creator_status,
-        NULL AS community_id,
-        NULL AS cost,
-        osd.content_review_id,
-        osd.campaign_id,
-        osd.content_review_state,
-        osd.project_id,
-        NULL AS mention_id,
-        osd.datetime_created,
-        osd.datetime_modified,
-        osd.date_last_reject,
-        osd.time_to_mark_complete,
-        NULL AS creator_tier,
-        NULL AS country_code,
-        NULL AS profile_image_url,
-        NULL AS social_account_id,
-        NULL AS post_link,
-        NULL AS caption,
-        NULL AS date_posted,
-        NULL AS network,
-        NULL AS post_type,
-        NULL AS insight_date,
-        0 AS impressions,
-        0 AS likes,
-        0 AS comments,
-        0 AS shares,
-        0 AS favorites,
-        0 AS plays,
-        0 AS dislikes,
-        0 AS current_followers,
-        0 AS closeups,
-        0 AS estimated_impressions,
-        0 AS exits,
-        NULL AS post_image,
-        0 AS taps,
-        0 AS unique_impressions,
-        0 AS views,
-        NULL AS first_activity_date,
-        NULL AS activation_type,
-        osd.datetime_created AS action_date,
-        osd.member_name,
-        0 AS tmv  -- Added tmv as 0 for non-live data
-    FROM other_creator_status_data osd
-),
-
--- Step 6: Fill social account data
-social_account_data AS (
-    SELECT
-        cd.member_id,
-        cd.program_id,
-        cd.post_id,
-        cd.creator_status,
-        cd.community_id,
-        cd.cost,
-        cd.content_review_id,
-        cd.campaign_id,
-        cd.content_review_state,
-        cd.project_id,
-        cd.mention_id,
-        cd.datetime_created,
-        cd.datetime_modified,
-        cd.date_last_reject,
-        cd.time_to_mark_complete,
+        cad.member_name,
+        cad.creator_status,
+        cad.agreement_id,
+        cad.date_agreement_agreed_upon,
+        cad.price,
+        cad.number_of_deliverables,
+        cad.avg_price_per_deliverable,
+        cad.budget_allocated,
+        cad.budget_utilized,
+        cad.contract_status,
+        cad.campaign_name,
         sa.country_code,
-        sa.profile_image_url,
-        p.social_account_id,
-        p.link AS post_link,
-        p.text AS caption,
-        DATE(p.datetime_posted) AS date_posted,
-        p.network,
-        p.post_type,
-        DATE(p.datetime_posted) AS insight_date,
-        p.impressions,
-        p.likes,
-        p.comments,
-        p.shares,
-        p.favorites,
-        p.plays,
-        p.dislikes,
-        p.current_followers AS current_followers,
-        p.closeups,
-        p.estimated_impressions,
-        p.exits,
-        p.image AS post_image,
-        p.taps,
-        p.unique_impressions,
-        p.views,
-        cd.first_activity_date,
-        cd.activation_type,
-        cd.creator_tier,
-        cd.action_date,
-        cd.member_name,
-        cd.tmv  -- Added tmv
-    FROM combined_data cd
-    LEFT JOIN bi.post p ON cd.post_id = p.id
-    LEFT JOIN bi.social_account sa ON p.social_account_id = sa.id
-),
-
--- Step 7: Fill campaign name
-campaign_data AS (
-    SELECT
-        sad.*,
-        p.title AS campaign_name,
-        -- Add the mall_location column
-        CASE
-            WHEN sad.caption ~* '@?albertvillepremiumoutlets' THEN 'Albertville Premium Outlets'
-            WHEN sad.caption ~* '@?allenpremiumoutlets|@?allenpremoutlets' THEN 'Allen Premium Outlets'
-            WHEN sad.caption ~* '@?arizonamills' THEN 'Arizona Mills'
-            WHEN sad.caption ~* '@?arundelmills' THEN 'Arundel Mills'
-            WHEN sad.caption ~* '@?aurorafarmspremoutlets' THEN 'Aurora Farms Premium Outlets'
-            WHEN sad.caption ~* '@?birchrunpremiumoutlets' THEN 'Birch Run Premium Outlets'
-            WHEN sad.caption ~* '@?calhounoutletmarketplace' THEN 'Calhoun Outlet Marketplace'
-            WHEN sad.caption ~* '@?camarillopremoutlets|@?camarillo_po' THEN 'Camarillo Premium Outlets'
-            WHEN sad.caption ~* '@?carlsbad_po' THEN 'Carlsbad Premium Outlets'
-            WHEN sad.caption ~* '@?carolinapremiumoutlets' THEN 'Carolina Premium Outlets'
-            WHEN sad.caption ~* '@?charlottepremoutlets|@?charpremoutlets' THEN 'Charlotte Premium Outlets'
-            WHEN sad.caption ~* '@?chicagopremiumoutlets|@?chipremoutlets' THEN 'Chicago Premium Outlets'
-            WHEN sad.caption ~* '@?cincinnati_po' THEN 'Cincinnati Premium Outlets'
-            WHEN sad.caption ~* '@?ClarksburgPremiumOutlets' THEN 'Clarksburg Premium Outlets'
-            WHEN sad.caption ~* '@?clintonpremoutlets' THEN 'Clinton Crossing Premium Outlets'
-            WHEN sad.caption ~* '@?shopcoloradomills' THEN 'Colorado Mills'
-            WHEN sad.caption ~* '@?concordmillsnc' THEN 'Concord Mills'
-            WHEN sad.caption ~* '@?denverpremiumoutlets|@?denverpremoutlets' THEN 'Denver Premium Outlets'
-            WHEN sad.caption ~* '@?deserthillspo' THEN 'Desert Hills Premium Outlets'
-            WHEN sad.caption ~* '@?ellenton_po' THEN 'Ellenton Premium Outlets'
-            WHEN sad.caption ~* '@?floridakeysom' THEN 'Florida Keys Outlet Marketplace'
-            WHEN sad.caption ~* '@?folsompo' THEN 'Folsom Premium Outlets'
-            WHEN sad.caption ~* '@?gaffneyoutletmarketplace' THEN 'Gaffney Outlet Marketplace'
-            WHEN sad.caption ~* '@?gilroypo' THEN 'Gilroy Premium Outlets'
-            WHEN sad.caption ~* '@?gloucesterpo' THEN 'Gloucester Premium Outlets'
-            WHEN sad.caption ~* '@?gppremiumoutlets' THEN 'Grand Prairie Premium Outlets'
-            WHEN sad.caption ~* '@?shopgrapevine|@?grapevinemills' THEN 'Grapevine Mills'
-            WHEN sad.caption ~* '@?shopgreatmall' THEN 'Great Mall'
-            WHEN sad.caption ~* '@?grovecitypo' THEN 'Grove City Premium Outlets'
-            WHEN sad.caption ~* '@?gulfport_po' THEN 'Gulfport Premium Outlets'
-            WHEN sad.caption ~* '@?gurneemills' THEN 'Gurnee Mills'
-            WHEN sad.caption ~* '@?hagerstownpo' THEN 'Hagerstown Premium Outlets'
-            WHEN sad.caption ~* '@?houstonpremiumoutlets|@?houstonpo' THEN 'Houston Premium Outlets'
-            WHEN sad.caption ~* '@?indianapremoutlets' THEN 'Indiana Premium Outlets'
-            WHEN sad.caption ~* '@?jacksonpremiumoutlets' THEN 'Jackson Premium Outlets'
-            WHEN sad.caption ~* '@?jerseyshorepo' THEN 'Jersey Shore Premium Outlets'
-            WHEN sad.caption ~* '@?johnsoncreekpo' THEN 'Johnson Creek Premium Outlets'
-            WHEN sad.caption ~* '@?shopkatymills' THEN 'Katy Mills'
-            WHEN sad.caption ~* '@?kitterypo' THEN 'Kittery Premium Outlets'
-            WHEN sad.caption ~* '@?lasamericaspo' THEN 'Las Americas Premium Outlets'
-            WHEN sad.caption ~* '@?lasvegasnorthpo' THEN 'Las Vegas North Premium Outlets'
-            WHEN sad.caption ~* '@?lasvegassouthpo' THEN 'Las Vegas South Premium Outlets'
-            WHEN sad.caption ~* '@?leepremiumoutlet' THEN 'Lee Premium Outlets'
-            WHEN sad.caption ~* '@?leesburgpo' THEN 'Leesburg Premium Outlets'
-            WHEN sad.caption ~* '@?lighthouseplacepo' THEN 'Lighthouse Place Premium Outlets'
-            WHEN sad.caption ~* '@?merrimack_po' THEN 'Merrimack Premium Outlets'
-            WHEN sad.caption ~* '@?napapremoutlets' THEN 'Napa Premium Outlets'
-            WHEN sad.caption ~* '@?norfolkpo' THEN 'Norfolk Premium Outlets'
-            WHEN sad.caption ~* '@?northbendpo' THEN 'North Bend Premium Outlets'
-            WHEN sad.caption ~* '@?northgeorgiapo' THEN 'North Georgia Premium Outlets'
-            WHEN sad.caption ~* '@?shopontario|@?ontariomills' THEN 'Ontario Mills'
-            WHEN sad.caption ~* '@?oprymillsnashville|@?shoprymills' THEN 'Opry Mills'
-            WHEN sad.caption ~* '@?orlandointpo' THEN 'Orlando International Premium Outlets'
-            WHEN sad.caption ~* '@?orlandooutletmarketplace' THEN 'Orlando Outlet Marketplace'
-            WHEN sad.caption ~* '@?orlandovinelandpo|@?orlandopovine' THEN 'Orlando Vineland Premium Outlets'
-            WHEN sad.caption ~* '@?osagebeachoutletmarketplace' THEN 'Osage Beach Outlet Marketplace'
-            WHEN sad.caption ~* '@?petalumavillage_po' THEN 'Petaluma Village Premium Outlets'
-            WHEN sad.caption ~* '@?philadelphiapo|@?philadelphia_po' THEN 'Philadelphia Premium Outlets'
-            WHEN sad.caption ~* '@?phxpremoutlets' THEN 'Phoenix Premium Outlets'
-            WHEN sad.caption ~* '@?pismobeachpo' THEN 'Pismo Beach Premium Outlets'
-            WHEN sad.caption ~* '@?pleasantpremoutlets' THEN 'Pleasant Prairie Premium Outlets'
-            WHEN sad.caption ~* '@?shoppotomacmills' THEN 'Potomac Mills'
-            WHEN sad.caption ~* '@?poc_eia' THEN 'Premium Outlet Collection Edmonton International Airport'
-            WHEN sad.caption ~* '@?premoutletsmtl' THEN 'Premium Outlets Montreal (EN)'
-            WHEN sad.caption ~* '@?queenstownpo' THEN 'Queenstown Premium Outlets'
-            WHEN sad.caption ~* '@?riograndepo' THEN 'Rio Grande Valley Premium Outlets'
-            WHEN sad.caption ~* '@?roundrockpo' THEN 'Round Rock Premium Outlets'
-            WHEN sad.caption ~* '@?sfpremiumoutlets' THEN 'San Francisco Premium Outlets'
-            WHEN sad.caption ~* '@?sanmarcospo' THEN 'San Marcos Premium Outlets'
-            WHEN sad.caption ~* '@?shopsawgrassmills|@?shopsawgrass' THEN 'Sawgrass Mills'
-            WHEN sad.caption ~* '@?seattlepo' THEN 'Seattle Premium Outlets'
-            WHEN sad.caption ~* '@?silversandspo' THEN 'Silver Sands Premium Outlets'
-            WHEN sad.caption ~* '@?staugustinepo' THEN 'St. Augustine Premium Outlets'
-            WHEN sad.caption ~* '@?stlouispo' THEN 'St. Louis Premium Outlets'
-            WHEN sad.caption ~* '@?sugarloafmills' THEN 'Sugarloaf Mills'
-            WHEN sad.caption ~* '@?tampa_po' THEN 'Tampa Premium Outlets'
-            WHEN sad.caption ~* '@?pocono_po' THEN 'The Crossings Premium Outlets'
-            WHEN sad.caption ~* '@?shopmillsatjerseygardens|@?millsatjersey' THEN 'The Mills at Jersey Gardens'
-            WHEN sad.caption ~* '@?outletsatorange' THEN 'The Outlets at Orange'
-            WHEN sad.caption ~* '@?toronto_po' THEN 'Toronto Premium Outlets'
-            WHEN sad.caption ~* '@?tucsonpremoutlets' THEN 'Tucson Premium Outlets'
-            WHEN sad.caption ~* '@?tcpremoutlets' THEN 'Twin Cities Premium Outlets'
-            WHEN sad.caption ~* '@?vacavillepo' THEN 'Vacaville Premium Outlets'
-            WHEN sad.caption ~* '@?waikelepo' THEN 'Waikele Premium Outlets'
-            WHEN sad.caption ~* '@?fingerlakespremoutlets' THEN 'Finger Lakes Premium Outlets'
-            WHEN sad.caption ~* '@?williamsburg_po' THEN 'Williamsburg Premium Outlets'
-            WHEN sad.caption ~* '@?woodburn_po' THEN 'Woodburn Premium Outlets'
-            WHEN sad.caption ~* '@?woodburycommonpo|@?wcpremiumoutlets' THEN 'Woodbury Common Premium Outlets'
-            WHEN sad.caption ~* '@?wrenthamvillagepo|@?wvpremiumoutlets' THEN 'Wrentham Village Premium Outlets'
-            -- Add other mall handles here
-            ELSE 'Unknown'
-        END AS mall_location
-    FROM social_account_data sad
-    LEFT JOIN bi.program p ON sad.program_id = p.id
+        sa.profile_image_url
 )
 
--- Final Query: Select all columns including campaign name, member name, and mall location
+-- Final Selection
 SELECT 
     member_id,
     program_id,
@@ -512,14 +311,22 @@ SELECT
     taps,
     unique_impressions,
     views,
-    insight_date,
-    country_code,
-    profile_image_url,
-    campaign_name,
+    datetime_created,
+    first_activity_date,
     activation_type,
     creator_tier,
     action_date,
     member_name,
-    mall_location,
-    tmv -- Added tmv
-FROM campaign_data;
+    number_of_deliverables,
+    avg_price_per_deliverable,
+    budget_allocated,
+    budget_utilized,
+    contract_status,
+    agreement_id,
+    date_agreement_agreed_upon,
+    price,
+    campaign_name,
+    country_code,
+    profile_image_url
+FROM performance_data;
+
