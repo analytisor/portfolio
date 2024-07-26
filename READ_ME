@@ -1,46 +1,36 @@
-# **Cohort Analysis with SQL**
+Cohort Analysis with SQL
 
 This SQL query is designed to perform cohort analysis on customer purchase data. The query aggregates customer purchase behavior over time, allowing for insights into customer retention, revenue, and lifetime value.
 
-## **<u>Overview</u>**
+Overview
 
-- **Purpose:** Cohort Analysis for Customer Retention and Revenue Tracking
-- **Complexity:** Moderate to High
-- **Character Count:** ~3,300 Characters
+Purpose: Cohort Analysis for Customer Retention and Revenue Tracking
+Complexity: Moderate to High
+Character Count: ~3,300 Characters
 
-## **<u>Key Components</u>**
+Key Components
+CTEs (Common Table Expressions): Structured and modular approach
+Window Functions: For calculating cumulative metrics
+Conditional Logic: Adjusts results based on current date
 
-- **<u>CTEs (Common Table Expressions)</u>**: Structured and modular approach
-- **<u>Window Functions</u>**: For calculating cumulative metrics
-- **<u>Conditional Logic</u>**: Adjusts results based on current date
+CTEs Used
+customer_purchases: Preprocessing sales data
+customer_cohorts: Identifying cohort groups
+cohort_analysis: Detailed per-customer analysis
+aggregated_cohorts: Summarizing cohort data
+cumulative_data: Tracking cumulative metrics
 
-## **<u>CTEs Used</u>**
+Challenges Addressed
+Cumulative Calculation: Ensuring accurate, non-decreasing count of unique repeat customers
+Handling Incomplete Months: Displaying 0 for metrics in yet-to-be-completed months
 
-1. **<u>customer_purchases</u>**: Preprocessing sales data
-2. **<u>customer_cohorts</u>**: Identifying cohort groups
-3. **<u>cohort_analysis</u>**: Detailed per-customer analysis
-4. **<u>aggregated_cohorts</u>**: Summarizing cohort data
-5. **<u>cumulative_data</u>**: Tracking cumulative metrics
+Usefulness
+Readability: Breaks down complex logic into readable segments
+Maintainability: Easier to update and manage
+Analytical Insight: Provides comprehensive view of customer retention and revenue trends
 
-## **<u>Challenges Addressed</u>**
+Usage
+To use this script, execute it in your SQL database environment. Ensure that the ECOM2.sales table contains the necessary columns and data. The resulting ECOM2.cohorts table will provide detailed cohort analysis metrics.
 
-- **<u>Cumulative Calculation</u>**: Ensuring accurate, non-decreasing count of unique repeat customers
-- **<u>Handling Incomplete Months</u>**: Displaying 0 for metrics in yet-to-be-completed months
-
-## **<u>Usefulness</u>**
-
-- **<u>Readability</u>**: Breaks down complex logic into readable segments
-- **<u>Maintainability</u>**: Easier to update and manage
-- **<u>Analytical Insight</u>**: Provides comprehensive view of customer retention and revenue trends
-
-## **<u>Usage</u>**
-
-To use this script, execute it in your SQL database environment. Ensure that the `ECOM2.sales` table contains the necessary columns and data. The resulting `ECOM2.cohorts` table will provide detailed cohort analysis metrics.
-
-## **<u>Contributing</u>**
-
+Contributing
 Contributions are welcome! If you have any suggestions or improvements, please submit a pull request or open an issue.
-
-## **<u>License</u>**
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
