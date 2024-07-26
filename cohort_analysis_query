@@ -1,5 +1,5 @@
 -- Step 1: Create or replace the cohorts table
-CREATE OR REPLACE TABLE ECOM2.cohorts AS
+CREATE OR REPLACE TABLE ECOM.cohorts AS
 
 -- Step 2: Aggregate raw sales data
 WITH customer_purchases AS (
@@ -9,7 +9,7 @@ WITH customer_purchases AS (
         DATE_TRUNC(CAST(InvoiceDate AS DATE), MONTH) as InvoiceMonth,  -- Truncate InvoiceDate to the month level
         Quantity * UnitPrice as TotalPrice  -- Calculate total price for each invoice
     FROM 
-        `ECOM2.sales`
+        `ECOM.sales`
 ),
 
 -- Step 3: Identify the first purchase month for each customer
